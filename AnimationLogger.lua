@@ -6,6 +6,7 @@
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local UIS = game:GetService("UserInputService")
+local MarketplaceService = game:GetService("MarketplaceService")
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
     warn("[Animation Logger] Run this in a client context.")
@@ -24,6 +25,12 @@ end
 
 local MAX_HISTORY = 300
 local MAX_VISIBLE = 70
+-- Each animation asset ID is looked up at most once in this session.
+-- Metadata requests run asynchronously and are spaced to avoid bursts.
+local assetNameCache = {}
+local lookupQueue = {}
+local queuedIds = {}
+local resolvingNames = false
 local history = {}
 local filterMode = "All"
 local query = ""
@@ -236,7 +243,7 @@ end
 local function makeRow(i)
     local panel = new("Frame", scroll, {
         Name = "Log" .. i,
-        Size = UDim2.new(1, -6, 0, 47),
+        Size = UDim2.new(1, -6, 0, 64),
         LayoutOrder = i,
         BackgroundColor3 = colors.row,
         BorderSizePixel = 0,
@@ -244,18 +251,29 @@ local function makeRow(i)
     corner(panel, 6)
     local title = new("TextLabel", panel, {
         Position = UDim2.fromOffset(8, 3),
-        Size = UDim2.new(1, -87, 0, 19),
+        Size = UDim2.new(1, -101, 0, 20),
         BackgroundTransparency = 1,
         Text = "",
-        Font = Enum.Font.GothamMedium,
-        TextSize = 12,
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
         TextColor3 = colors.text,
         TextXAlignment = Enum.TextXAlignment.Left,
         TextTruncate = Enum.TextTruncate.AtEnd,
     })
     local detail = new("TextLabel", panel, {
-        Position = UDim2.fromOffset(8, 23),
-        Size = UDim2.new(1, -87, 0, 18),
+        Position = UDim2.fromOffset(8, 24),
+        Size = UDim2.new(1, -101, 0, 18),
+        BackgroundTransparency = 1,
+        Text = "",
+        Font = Enum.Font.GothamMedium,
+        TextSize = 11,
+        TextColor3 = colors.muted,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+    local meta = new("TextLabel", panel, {
+        Position = UDim2.fromOffset(8, 43),
+        Size = UDim2.new(1, -101, 0, 17),
         BackgroundTransparency = 1,
         Text = "",
         Font = Enum.Font.Code,
@@ -264,10 +282,15 @@ local function makeRow(i)
         TextXAlignment = Enum.TextXAlignment.Left,
         TextTruncate = Enum.TextTruncate.AtEnd,
     })
-    local copyButton = button(panel, "Copy ID",
-        UDim2.new(1, -77, 0.5, -14), UDim2.fromOffset(70, 28))
-    local row = {panel = panel, title = title, detail = detail, entry = nil}
-    connect(copyButton.Activated, function()
+    local copyName = button(panel, "Copy Name",
+        UDim2.new(1, -88, 0, 4), UDim2.fromOffset(80, 26))
+    local copyId = button(panel, "Copy ID",
+        UDim2.new(1, -88, 0, 34), UDim2.fromOffset(80, 26))
+    local row = {panel = panel, title = title, detail = detail, meta = meta, entry = nil}
+    connect(copyName.Activated, function()
+        if row.entry then copyText(row.entry.name) end
+    end)
+    connect(copyId.Activated, function()
         if row.entry then copyText(row.entry.id) end
     end)
     return row
@@ -295,8 +318,9 @@ local function render()
             if not rowPool[displayed] then rowPool[displayed] = makeRow(displayed) end
             local row = rowPool[displayed]
             row.entry = entry
-            row.title.Text = "[" .. entry.category .. "] " .. entry.character .. " / " .. entry.name
-            row.detail.Text = entry.id .. "    " .. entry.time .. " (" .. entry.source .. ")"
+            row.title.Text = entry.name
+            row.detail.Text = "[" .. entry.category .. "] " .. entry.character
+            row.meta.Text = "ID: " .. entry.id .. " | " .. entry.time .. " (" .. entry.source .. ")"
             row.panel.Visible = true
         end
     end
@@ -319,6 +343,39 @@ local function scheduleRender()
     task.defer(function()
         refreshQueued = false
         if not closed then render() end
+    end)
+end
+
+-- Resolve the name listed on the Roblox animation asset page.
+-- GetProductInfoAsync can reject private/deleted/restricted assets, so
+-- retain the local Animation/AnimationTrack name if lookup fails.
+local function queueAssetName(id)
+    if closed or not id:match("^%d+$") or assetNameCache[id] ~= nil or queuedIds[id] then return end
+    if #lookupQueue >= MAX_HISTORY then return end
+    queuedIds[id] = true
+    table.insert(lookupQueue, id)
+    if resolvingNames then return end
+    resolvingNames = true
+    task.spawn(function()
+        while not closed and #lookupQueue > 0 do
+            local nextId = table.remove(lookupQueue, 1)
+            queuedIds[nextId] = nil
+            local ok, info = pcall(function()
+                return MarketplaceService:GetProductInfoAsync(tonumber(nextId), Enum.InfoType.Asset)
+            end)
+            if closed then break end
+            local resolved = ok and type(info) == "table"
+                and type(info.Name) == "string" and info.Name ~= "" and info.Name or false
+            assetNameCache[nextId] = resolved
+            if resolved then
+                for _, entry in ipairs(history) do
+                    if entry.id == nextId then entry.name = resolved end
+                end
+                scheduleRender()
+            end
+            task.wait(0.8)
+        end
+        resolvingNames = false
     end)
 end
 
@@ -349,7 +406,10 @@ local function recordTrack(animator, track, source)
     local asset = animation and animation.AnimationId or ""
     local id = tostring(asset):match("%d+") or tostring(asset)
     if id == "" then id = "Unknown ID" end
-    local name = (animation and animation.Name) or track.Name
+    local fallbackName = (animation and animation.Name) or track.Name or "Unknown animation"
+    if fallbackName == "" then fallbackName = "Unknown animation" end
+    local knownName = assetNameCache[id]
+    local name = (type(knownName) == "string" and knownName) or tostring(fallbackName)
     local character, category = findCharacter(animator)
     table.insert(history, 1, {
         time = os.date("%H:%M:%S"),
@@ -360,6 +420,7 @@ local function recordTrack(animator, track, source)
         source = source,
     })
     if #history > MAX_HISTORY then table.remove(history) end
+    queueAssetName(id)
     scheduleRender()
 end
 
